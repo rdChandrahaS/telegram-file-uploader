@@ -5,6 +5,7 @@ CONFIG_DIR = Path.home() / f".{APP_NAME}"
 SESSION_PATH = CONFIG_DIR / "telegram.session"
 STATE_PATH = CONFIG_DIR / "upload_state.json"
 GLOBAL_ENV_PATH = CONFIG_DIR / ".env"
+LOGS_DIR = CONFIG_DIR / "logs"
 ENV_FILENAME = ".env"
 LOG_FILENAME = "upload-telegram.log"
 
@@ -22,7 +23,11 @@ EXCLUDED_NAMES = {
     "Thumbs.db",
     ".env",
     ".env.local",
-    "telegram_uploader.py",
+    ".telegram-folder-uploader",
     "telegram-folder-uploader",
+    "upload_state.json",
+    "telegram_uploader.py",
+    "run.bat",
+    "run.sh",
     LOG_FILENAME,
 }

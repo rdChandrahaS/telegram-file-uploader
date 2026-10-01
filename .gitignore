@@ -1,12 +1,35 @@
+# Virtual environment & Python cache
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Packaging / CLI install artifacts (uv / pip / hatchling)
+build/
+dist/
+*.egg-info/
+
+# Environment variables & secrets
 .env
 .env.*
 !.env.example
+
+# Telethon session & upload state files
 *.session
 *.session-journal
 telegram.session
+upload_state.json
+
+# Uploader logs
+upload-telegram.log
+*.log
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

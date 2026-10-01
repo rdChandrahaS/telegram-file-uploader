@@ -5,8 +5,11 @@ import os
 import stat
 from pathlib import Path
 from typing import Any
+from rich.console import Console
 
 from .constants import CONFIG_DIR, STATE_PATH
+
+console = Console()
 
 
 def _private(path: Path) -> None:
@@ -24,7 +27,18 @@ def load_state() -> dict[str, Any]:
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except json.JSONDecodeError:
+        corrupt_backup = STATE_PATH.with_suffix(".corrupt.json")
+        try:
+            STATE_PATH.replace(corrupt_backup)
+            _private(corrupt_backup)
+        except OSError:
+            pass
+        console.print(
+            f"[bold yellow]⚠ Warning:[/bold yellow] State file was corrupted and backed up to {corrupt_backup}."
+        )
+        return {}
+    except OSError:
         return {}
 
 

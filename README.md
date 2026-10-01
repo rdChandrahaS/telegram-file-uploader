@@ -1,12 +1,13 @@
 # Telegram Folder Uploader
 
-A local Python project that uploads every file from a folder to a Telegram group or channel using Telegram's MTProto API through Telethon.
+An interactive Terminal UI (TUI) project that uploads files from any local folder to a Telegram group or channel using Telethon.
 
-## Project structure
+## Project Structure
 
 ```text
 telegram-folder-uploader/
 ├── pyproject.toml
+├── uv.lock
 ├── README.md
 ├── .env.example
 ├── .gitignore
@@ -18,10 +19,10 @@ telegram-folder-uploader/
         ├── config.py
         ├── constants.py
         ├── files.py
+        ├── logger.py
         ├── state.py
         ├── telegram.py
         └── uploader.py
-```
 
 ## Linux + uv setup
 
