@@ -4,13 +4,19 @@ import argparse
 import asyncio
 from pathlib import Path
 
+import questionary
 from rich.console import Console
 from telethon import TelegramClient
 from telethon.errors import RPCError
+from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 
-from .config import ensure_config_dir, load_credentials, protect_session
-from .constants import SESSION_PATH
+from .config import (
+    ensure_config_dir,
+    load_credentials,
+    save_encrypted_vault,
+)
+from .constants import VAULT_PATH
 from .files import collect_files
 from .logger import setup_folder_logger
 from .telegram import prompt_destination
@@ -51,6 +57,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _prompt_login_code() -> str:
+    code = await questionary.text(
+        "Enter the login code sent to your Telegram app:",
+        validate=lambda val: bool(val.strip()) or "Login code cannot be empty",
+    ).ask_async()
+    if not code:
+        raise KeyboardInterrupt
+    return code.strip()
+
+
+async def _prompt_2fa_password() -> str:
+    pwd = await questionary.password(
+        "Enter your Telegram Two-Step Verification (2FA) password:",
+    ).ask_async()
+    if pwd is None:
+        raise KeyboardInterrupt
+    return pwd
+
+
 async def async_main(args: argparse.Namespace) -> int:
     source_root = Path(args.folder).expanduser().resolve()
     if not source_root.exists() or not source_root.is_dir():
@@ -64,22 +89,47 @@ async def async_main(args: argparse.Namespace) -> int:
 
     ensure_config_dir()
     logger, log_path = setup_folder_logger(source_root)
-    api_id, api_hash = load_credentials(source_root)
+    auth = await load_credentials(source_root)
+
+    # Use in-memory StringSession (loaded from decrypted vault if available)
+    session = StringSession(auth.session_string) if auth.session_string else StringSession()
 
     console.print("\n[cyan]Connecting to Telegram...[/cyan]")
-    client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+    client = TelegramClient(session, auth.api_id, auth.api_hash)
 
     try:
-        await client.start()
-        protect_session(SESSION_PATH)
+        await client.start(
+            phone=lambda: auth.phone,
+            code_callback=_prompt_login_code,
+            password=_prompt_2fa_password,
+        )
 
         me = await client.get_me()
-        account_name = getattr(me, "username", None) or getattr(me, "first_name", None) or str(me.id)
+        username = getattr(me, "username", None)
+        account_name = f"@{username}" if username else (getattr(me, "first_name", None) or str(me.id))
+        actual_phone = f"+{me.phone}" if getattr(me, "phone", None) else auth.phone
+
+        # Encrypt API ID, API Hash, Phone, and active StringSession into vault.enc
+        if auth.save_for_future and auth.vault_password:
+            session_str = client.session.save()
+            save_encrypted_vault(
+                api_id=auth.api_id,
+                api_hash=auth.api_hash,
+                phone=actual_phone,
+                session_string=session_str,
+                password=auth.vault_password,
+                account_name=account_name,
+            )
+            console.print(f"[green]🔒 Credentials & session encrypted in {VAULT_PATH}[/green]")
+
         is_premium = bool(getattr(me, "premium", False))
         max_file_size = 4 * 1024**3 if is_premium else 2 * 1024**3
-
         tier_label = "Premium (4 GB limit)" if is_premium else "Standard (2 GB limit)"
-        console.print(f"[green]✔ Logged in as:[/green] [bold]{account_name}[/bold] [{tier_label}]\n")
+
+        console.print(
+            f"[green]✔ Logged in as:[/green] [bold]{account_name}[/bold] "
+            f"({actual_phone}) [{tier_label}]\n"
+        )
 
         # Step 1: Ask for destination group link (or pick from user's groups)
         try:

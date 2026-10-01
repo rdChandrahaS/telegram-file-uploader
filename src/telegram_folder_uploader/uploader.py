@@ -19,12 +19,18 @@ from rich.progress import (
 )
 from rich.table import Table
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import (
+    ChannelInvalidError,
+    ChatIdInvalidError,
+    FloodWaitError,
+    PeerIdInvalidError,
+    RPCError,
+)
 from telethon.utils import get_peer_id
 
 from .files import file_key, folder_size, human_bytes
 from .state import load_state, save_state
-from .telegram import display_destination
+from .telegram import display_destination, get_valid_input_peer
 
 console = Console()
 
@@ -117,6 +123,13 @@ async def upload_files(
     state = load_state()
     chat_id = get_peer_id(entity)
     dest_name = display_destination(entity)
+    try:
+        input_peer = await get_valid_input_peer(client, entity)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Could not resolve destination '%s': %s", dest_name, exc)
+        raise RuntimeError(
+            f"Could not resolve a valid Telegram input peer for '{dest_name}': {exc}"
+        ) from exc
 
     uploaded = 0
     skipped = 0
@@ -224,7 +237,7 @@ async def upload_files(
             while True:
                 try:
                     await client.send_file(
-                        entity,
+                        input_peer,
                         str(path),
                         caption=relative,
                         parse_mode=None,
@@ -252,6 +265,15 @@ async def upload_files(
                     logger.warning(wait_msg)
                     await asyncio.sleep(exc.seconds + 1)
                     progress.reset(file_task)
+
+                except (PeerIdInvalidError, ChannelInvalidError, ChatIdInvalidError) as exc:
+                    # Destination itself is bad: every remaining file would fail too.
+                    logger.error("FAILED   | %s | Invalid destination: %s", relative, exc)
+                    progress.remove_task(file_task)
+                    raise RuntimeError(
+                        f"Telegram rejected destination '{dest_name}' as an invalid peer "
+                        f"while sending {relative}. Re-select the group and try again."
+                    ) from exc
 
                 except (RPCError, OSError, RuntimeError) as exc:
                     err_msg = f"Failed to upload {relative}: {exc}"

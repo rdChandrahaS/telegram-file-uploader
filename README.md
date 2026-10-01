@@ -23,7 +23,8 @@ telegram-folder-uploader/
         ├── state.py
         ├── telegram.py
         └── uploader.py
-
+        
+```markdown
 ## Linux + uv setup
 
 Install `uv` first if it is not already installed.
