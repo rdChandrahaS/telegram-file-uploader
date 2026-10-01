@@ -2,270 +2,706 @@ from __future__ import annotations
 
 import re
 from typing import Any
+
 import questionary
 from rich.console import Console
 from telethon import TelegramClient, functions, types
-from telethon.errors import RPCError
+from telethon.errors import (
+    ChannelInvalidError,
+    ChatIdInvalidError,
+    PeerIdInvalidError,
+    RPCError,
+)
 from telethon.utils import get_peer_id
 
 console = Console()
 
 
 def clean_group_input(value: str) -> str:
+    """Normalize Telegram destination input."""
     value = value.strip()
-    return re.sub(r"^tg://openmessage\?user_id=", "", value)
+
+    # Support tg://openmessage?user_id=...
+    value = re.sub(
+        r"^tg://openmessage\?user_id=",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    return value
 
 
-async def _ensure_valid_peer(client: TelegramClient, entity: Any) -> Any:
-    """Follows basic-group -> supergroup migrations and ensures a valid entity."""
+async def _ensure_valid_entity(
+    client: TelegramClient,
+    entity: Any,
+) -> Any:
+    """
+    Normalize a Telegram entity.
+
+    Handles:
+    - basic group -> supergroup migration
+    - incomplete/min channel entities
+    """
     migrated = getattr(entity, "migrated_to", None)
 
     if isinstance(migrated, types.InputChannel):
         entity = await client.get_entity(migrated)
 
     if getattr(entity, "min", False):
-        entity = await client.get_entity(get_peer_id(entity))
+        entity = await client.get_entity(
+            get_peer_id(entity)
+        )
 
     return entity
 
 
-async def _peer_is_usable(client: TelegramClient, peer: Any) -> bool:
-    """Cheap live check: ask Telegram for 1 message from this peer.
-
-    Telethon happily builds an InputPeer with a missing/zero access_hash from a
-    stale entity object, and the failure only shows up later in SendMediaRequest
-    ("An invalid Peer was used"), *after* the whole file has been uploaded.
-    Probing first catches that immediately.
+async def get_valid_input_peer(
+    client: TelegramClient,
+    entity: Any,
+) -> Any:
     """
-    try:
-        await client.get_messages(peer, limit=1)
-        return True
-    except (RPCError, ValueError, TypeError):
-        return False
+    Refresh and return the best InputPeer available for the entity.
 
+    The important path is:
+        Telegram dialogs -> Dialog.input_entity
 
-async def get_valid_input_peer(client: TelegramClient, entity: Any) -> Any:
-    """Return an InputPeer that Telegram has actually accepted.
+    Dialog.input_entity contains the peer information Telethon received
+    for that chat, including the access hash where applicable.
 
-    Tries, in order:
-      1. the entity passed in (following basic-group -> supergroup migration),
-      2. Telethon's session cache for that peer id,
-      3. the matching dialog's own ``input_entity`` (always carries a fresh
-         access_hash straight from the dialog list).
+    This avoids depending solely on a stale ID/entity cached in the session.
     """
-    peer_id = get_peer_id(entity)
-    candidates: list[Any] = []
 
-    # 1. Follow migration (old basic group -> supergroup) if needed
-    try:
-        entity = await _ensure_valid_peer(client, entity)
-        peer_id = get_peer_id(entity)
-        candidates.append(await client.get_input_entity(entity))
-    except (RPCError, ValueError, TypeError):
-        pass
-
-    # 2. Session cache lookup by id
-    try:
-        candidates.append(await client.get_input_entity(peer_id))
-    except (RPCError, ValueError, TypeError):
-        pass
-
-    for peer in candidates:
-        if await _peer_is_usable(client, peer):
-            return peer
-
-    # 3. Fall back to the dialog list (fresh access hashes)
-    async for dialog in client.iter_dialogs():
-        if dialog.id == peer_id:
-            if await _peer_is_usable(client, dialog.input_entity):
-                return dialog.input_entity
-            break
-
-    raise ValueError(
-        "Telegram rejected this destination as an invalid peer. The chat may have "
-        "been migrated/deleted, or your account can no longer access it. "
-        "Pick another group, or choose '➕ Create a New Private Group'."
+    entity = await _ensure_valid_entity(
+        client,
+        entity,
     )
 
+    target_peer_id = get_peer_id(entity)
+    last_error: Exception | None = None
 
-async def resolve_chat(client: TelegramClient, raw: str) -> Any:
+    # ---------------------------------------------------------------
+    # 1. Refresh dialogs from Telegram and use the matching
+    #    dialog.input_entity directly.
+    # ---------------------------------------------------------------
+    try:
+        async for dialog in client.iter_dialogs(
+            limit=None
+        ):
+            try:
+                dialog_entity = await _ensure_valid_entity(
+                    client,
+                    dialog.entity,
+                )
+            except Exception:
+                continue
+
+            try:
+                dialog_peer_id = get_peer_id(
+                    dialog_entity
+                )
+            except (TypeError, ValueError):
+                continue
+
+            if dialog_peer_id != target_peer_id:
+                continue
+
+            # This is the important object:
+            # Telegram supplied it as part of the dialog response.
+            input_entity = dialog.input_entity
+
+            if input_entity is None:
+                continue
+
+            return input_entity
+
+    except RPCError as exc:
+        last_error = exc
+
+    # ---------------------------------------------------------------
+    # 2. Try a fresh entity lookup.
+    # ---------------------------------------------------------------
+    try:
+        username = getattr(
+            entity,
+            "username",
+            None,
+        )
+
+        if username:
+            fresh_entity = await client.get_entity(
+                username
+            )
+        else:
+            fresh_entity = await client.get_entity(
+                entity
+            )
+
+        fresh_entity = await _ensure_valid_entity(
+            client,
+            fresh_entity,
+        )
+
+        input_entity = await client.get_input_entity(
+            fresh_entity
+        )
+
+        return input_entity
+
+    except (
+        PeerIdInvalidError,
+        ChannelInvalidError,
+        ChatIdInvalidError,
+        ValueError,
+        TypeError,
+        RPCError,
+    ) as exc:
+        last_error = exc
+
+    # ---------------------------------------------------------------
+    # 3. Final Telethon cache fallback.
+    # ---------------------------------------------------------------
+    try:
+        input_entity = await client.get_input_entity(
+            entity
+        )
+
+        return input_entity
+
+    except Exception as exc:  # noqa: BLE001
+        last_error = exc
+
+    title = (
+        getattr(entity, "title", None)
+        or getattr(entity, "username", None)
+        or str(target_peer_id)
+    )
+
+    raise RuntimeError(
+        f"Could not resolve a usable Telegram peer for "
+        f"'{title}'. The account may not currently have "
+        f"access to that chat."
+    ) from last_error
+
+
+async def resolve_chat(
+    client: TelegramClient,
+    raw: str,
+) -> Any:
+    """
+    Resolve a Telegram destination.
+
+    Supported:
+    - Telegram Web URLs
+    - public t.me / telegram.me links
+    - private invite links
+    - private /c/ links
+    - @username
+    - numeric IDs
+    """
+
     raw = clean_group_input(raw)
+
     if not raw:
-        raise ValueError("No Telegram destination was supplied.")
+        raise ValueError(
+            "No Telegram destination was supplied."
+        )
 
-    # Warm up the in-memory session cache with recent dialogs
-    await client.get_dialogs(limit=150)
+    # Refresh entity/dialog cache.
+    await client.get_dialogs(
+        limit=200
+    )
 
-    # 1. Telegram Web browser URLs: https://web.telegram.org/a/#-100123456 or /k/#-123456
-    web_match = re.search(r"web\.telegram\.org/.*#(-?\d+)", raw, re.IGNORECASE)
-    if web_match:
-        peer_id = int(web_match.group(1))
-        entity = await client.get_entity(peer_id)
-        return await _ensure_valid_peer(client, entity)
-
-    # 2. Private invite links: https://t.me/+XXXX or https://t.me/joinchat/XXXX
-    invite_match = re.search(
-        r"(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)([^/?#\s]+)",
+    # ---------------------------------------------------------------
+    # 1. Telegram Web URL
+    #
+    # Examples:
+    # https://web.telegram.org/a/#-1001234567890
+    # https://web.telegram.org/k/#-123456789
+    # ---------------------------------------------------------------
+    web_match = re.search(
+        r"web\.telegram\.org/.*#(-?\d+)",
         raw,
         re.IGNORECASE,
     )
+
+    if web_match:
+        peer_id = int(
+            web_match.group(1)
+        )
+
+        try:
+            entity = await client.get_entity(
+                peer_id
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Telegram could not resolve the Web Telegram "
+                "destination. Select the group from your "
+                "Telegram dialogs instead."
+            ) from exc
+
+        return await _ensure_valid_entity(
+            client,
+            entity,
+        )
+
+    # ---------------------------------------------------------------
+    # 2. Private invite link
+    #
+    # https://t.me/+xxxx
+    # https://t.me/joinchat/xxxx
+    # ---------------------------------------------------------------
+    invite_match = re.search(
+        r"(?:https?://)?(?:t|telegram)\.me/"
+        r"(?:\+|joinchat/)([^/?#\s]+)",
+        raw,
+        re.IGNORECASE,
+    )
+
     if invite_match:
         invite_hash = invite_match.group(1)
+
         try:
-            checked = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+            checked = await client(
+                functions.messages.CheckChatInviteRequest(
+                    hash=invite_hash
+                )
+            )
         except RPCError as exc:
-            raise ValueError(f"Telegram could not inspect that invite link: {exc}") from exc
+            raise ValueError(
+                f"Telegram could not inspect that invite link: {exc}"
+            ) from exc
 
-        if isinstance(checked, types.messages.ChatInviteAlready):
-            return await _ensure_valid_peer(client, checked.chat)
+        if isinstance(
+            checked,
+            types.messages.ChatInviteAlready,
+        ):
+            return await _ensure_valid_entity(
+                client,
+                checked.chat,
+            )
 
-        title = getattr(checked, "title", "this chat")
+        title = getattr(
+            checked,
+            "title",
+            "this chat",
+        )
+
         join_now = await questionary.confirm(
-            f"Invite link points to '{title}'. Join this group now?", default=True
+            f"Invite link points to '{title}'. "
+            f"Join this group now?",
+            default=True,
         ).ask_async()
+
+        if join_now is None:
+            raise KeyboardInterrupt
+
         if not join_now:
-            raise ValueError("Cancelled joining invite link.")
+            raise ValueError(
+                "Cancelled joining invite link."
+            )
 
-        joined = await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
-        if getattr(joined, "chats", None):
-            return await _ensure_valid_peer(client, joined.chats[0])
-        raise ValueError("Telegram did not return the joined chat.")
+        try:
+            joined = await client(
+                functions.messages.ImportChatInviteRequest(
+                    hash=invite_hash
+                )
+            )
+        except RPCError as exc:
+            raise ValueError(
+                f"Telegram could not join that invite link: {exc}"
+            ) from exc
 
-    # 3. Private chat/channel internal links: https://t.me/c/1234567890/1
+        if not getattr(
+            joined,
+            "chats",
+            None,
+        ):
+            raise ValueError(
+                "Telegram did not return the joined chat."
+            )
+
+        return await _ensure_valid_entity(
+            client,
+            joined.chats[0],
+        )
+
+    # ---------------------------------------------------------------
+    # 3. Private /c/ link
+    #
+    # https://t.me/c/1234567890/123
+    #
+    # The actual channel/supergroup must already be known to
+    # the account/session.
+    # ---------------------------------------------------------------
     private_c_match = re.search(
-        r"(?:https?://)?(?:t|telegram)\.me/c/(\d+)(?:/\d+)?",
+        r"(?:https?://)?(?:t|telegram)\.me/"
+        r"c/(\d+)(?:/\d+)?",
         raw,
         re.IGNORECASE,
     )
+
     if private_c_match:
-        channel_id = int(f"-100{private_c_match.group(1)}")
-        entity = await client.get_entity(channel_id)
-        return await _ensure_valid_peer(client, entity)
+        channel_id = int(
+            f"-100{private_c_match.group(1)}"
+        )
 
-    # 4. Public t.me / telegram.me links: https://t.me/username or t.me/username/
+        try:
+            entity = await client.get_entity(
+                channel_id
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                "Telegram could not resolve this private /c/ link. "
+                "Select the group from your Telegram dialogs first."
+            ) from exc
+
+        return await _ensure_valid_entity(
+            client,
+            entity,
+        )
+
+    # ---------------------------------------------------------------
+    # 4. Public Telegram link
+    #
+    # https://t.me/groupname
+    # https://telegram.me/groupname
+    # ---------------------------------------------------------------
     public_match = re.fullmatch(
-        r"(?:https?://)?(?:t|telegram)\.me/([A-Za-z0-9_]+)/?(?:\?.*)?",
+        r"(?:https?://)?(?:t|telegram)\.me/"
+        r"([A-Za-z0-9_]+)/?(?:\?.*)?",
         raw,
         re.IGNORECASE,
     )
+
     if public_match:
-        entity = await client.get_entity(public_match.group(1))
-        return await _ensure_valid_peer(client, entity)
+        username = public_match.group(1)
 
-    # 5. Direct @username or numeric ID
+        try:
+            entity = await client.get_entity(
+                username
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Telegram could not resolve @{username}."
+            ) from exc
+
+        return await _ensure_valid_entity(
+            client,
+            entity,
+        )
+
+    # ---------------------------------------------------------------
+    # 5. @username
+    # ---------------------------------------------------------------
     if raw.startswith("@"):
-        entity = await client.get_entity(raw)
-        return await _ensure_valid_peer(client, entity)
+        entity = await client.get_entity(
+            raw
+        )
 
+        return await _ensure_valid_entity(
+            client,
+            entity,
+        )
+
+    # ---------------------------------------------------------------
+    # 6. Numeric ID or other Telethon-supported input.
+    # ---------------------------------------------------------------
     try:
-        entity = await client.get_entity(int(raw))
+        entity = await client.get_entity(
+            int(raw)
+        )
     except ValueError:
-        entity = await client.get_entity(raw)
-    return await _ensure_valid_peer(client, entity)
+        entity = await client.get_entity(
+            raw
+        )
+
+    return await _ensure_valid_entity(
+        client,
+        entity,
+    )
 
 
-async def _create_new_private_group(client: TelegramClient) -> Any:
-    """Creates a new private Supergroup directly in your Telegram account."""
+async def _create_new_private_group(
+    client: TelegramClient,
+) -> Any:
+    """Create a new private Telegram supergroup."""
     title = await questionary.text(
         "Enter a name for your new private Telegram group:",
-        validate=lambda t: bool(t.strip()) or "Group name cannot be empty",
+        validate=lambda value: (
+            bool(value.strip())
+            or "Group name cannot be empty"
+        ),
     ).ask_async()
-    if not title:
+
+    if title is None:
         raise KeyboardInterrupt
+
+    title = title.strip()
+
+    if not title:
+        raise ValueError(
+            "Group name cannot be empty."
+        )
 
     result = await client(
         functions.channels.CreateChannelRequest(
-            title=title.strip(),
-            about="Created by upload-telegram",
+            title=title,
+            about="Created by telegram-folder-uploader",
             megagroup=True,
         )
     )
-    if getattr(result, "chats", None):
-        new_group = result.chats[0]
-        console.print(f"[green]✔ Created new private supergroup:[/green] [bold]{title.strip()}[/bold]")
-        return await _ensure_valid_peer(client, new_group)
-    raise ValueError("Failed to create the Telegram group.")
+
+    if not getattr(
+        result,
+        "chats",
+        None,
+    ):
+        raise ValueError(
+            "Failed to create the Telegram group."
+        )
+
+    new_group = result.chats[0]
+
+    console.print(
+        "[green]✔ Created new private "
+        "supergroup:[/green] "
+        f"[bold]{title}[/bold]"
+    )
+
+    return await _ensure_valid_entity(
+        client,
+        new_group,
+    )
 
 
-async def prompt_destination(client: TelegramClient, prefilled_group: str | None = None) -> Any:
+async def prompt_destination(
+    client: TelegramClient,
+    prefilled_group: str | None = None,
+) -> Any:
+    """Prompt the user to select a Telegram destination."""
+
+    # ---------------------------------------------------------------
+    # Direct --group argument
+    # ---------------------------------------------------------------
     if prefilled_group:
-        return await resolve_chat(client, prefilled_group)
+        return await resolve_chat(
+            client,
+            prefilled_group,
+        )
 
     mode = await questionary.select(
         "How would you like to select the destination Telegram group?",
         choices=[
-            questionary.Choice("📋 Choose from my Telegram Groups / Channels", value="list"),
-            questionary.Choice("➕ Create a New Private Group right now", value="create"),
-            questionary.Choice("🔗 Paste a Group / Invite Link (Public or Private)", value="link"),
+            questionary.Choice(
+                "📋 Choose from my Telegram Groups / Channels",
+                value="list",
+            ),
+            questionary.Choice(
+                "➕ Create a New Private Group right now",
+                value="create",
+            ),
+            questionary.Choice(
+                "🔗 Paste a Group / Invite Link "
+                "(Public or Private)",
+                value="link",
+            ),
         ],
     ).ask_async()
 
     if mode is None:
         raise KeyboardInterrupt
 
+    # ---------------------------------------------------------------
+    # Create a group
+    # ---------------------------------------------------------------
     if mode == "create":
-        return await _create_new_private_group(client)
+        return await _create_new_private_group(
+            client
+        )
 
+    # ---------------------------------------------------------------
+    # Paste link
+    # ---------------------------------------------------------------
     if mode == "link":
         raw_link = await questionary.text(
-            "Paste Telegram group link (e.g. https://t.me/+xxxx or https://t.me/groupname):",
-            validate=lambda text: bool(text.strip()) or "Please enter a valid group link or @username",
+            "Paste Telegram group link "
+            "(e.g. https://t.me/+xxxx "
+            "or https://t.me/groupname):",
+            validate=lambda value: (
+                bool(value.strip())
+                or "Please enter a valid group link"
+            ),
         ).ask_async()
-        if not raw_link:
-            raise KeyboardInterrupt
-        return await resolve_chat(client, raw_link)
 
-    console.print("[cyan]Loading your Telegram groups and channels...[/cyan]")
-    choices = []
+        if raw_link is None:
+            raise KeyboardInterrupt
+
+        raw_link = raw_link.strip()
+
+        if not raw_link:
+            raise ValueError(
+                "No Telegram destination was supplied."
+            )
+
+        return await resolve_chat(
+            client,
+            raw_link,
+        )
+
+    # ---------------------------------------------------------------
+    # Select from dialogs
+    # ---------------------------------------------------------------
+    console.print(
+        "[cyan]Loading your Telegram groups "
+        "and channels...[/cyan]"
+    )
+
+    choices: list[questionary.Choice] = []
     seen_ids: set[int] = set()
 
-    async for dialog in client.iter_dialogs(limit=200):
+    # Fetch all dialogs. This is also important for obtaining fresh
+    # dialog.input_entity values from Telegram.
+    async for dialog in client.iter_dialogs(
+        limit=None
+    ):
         entity = dialog.entity
-        if not isinstance(entity, (types.Chat, types.Channel)):
+
+        if not isinstance(
+            entity,
+            (types.Chat, types.Channel),
+        ):
             continue
 
-        # Skip left, kicked, or forbidden chats
-        if getattr(entity, "left", False) or getattr(entity, "kicked", False):
+        if getattr(
+            entity,
+            "left",
+            False,
+        ):
             continue
 
-        # If a basic Chat was migrated to a Supergroup, resolve the Supergroup instead
-        if getattr(entity, "deactivated", False) or getattr(entity, "migrated_to", None):
-            migrated = getattr(entity, "migrated_to", None)
-            if isinstance(migrated, types.InputChannel):
-                try:
-                    entity = await client.get_entity(migrated)
-                except Exception:  # noqa: BLE001
-                    continue
-            else:
+        if getattr(
+            entity,
+            "kicked",
+            False,
+        ):
+            continue
+
+        if getattr(
+            entity,
+            "deactivated",
+            False,
+        ):
+            continue
+
+        # Follow basic-group migration.
+        migrated = getattr(
+            entity,
+            "migrated_to",
+            None,
+        )
+
+        if isinstance(
+            migrated,
+            types.InputChannel,
+        ):
+            try:
+                entity = await client.get_entity(
+                    migrated
+                )
+            except RPCError:
                 continue
 
-        peer_id = get_peer_id(entity)
+        try:
+            peer_id = get_peer_id(entity)
+        except (ValueError, TypeError):
+            continue
+
         if peer_id in seen_ids:
             continue
+
         seen_ids.add(peer_id)
 
-        is_channel = isinstance(entity, types.Channel) and getattr(entity, "broadcast", False)
-        badge = "📢 Channel" if is_channel else "👥 Group  "
-        title = getattr(entity, "title", dialog.name)
-        choices.append(questionary.Choice(f"{badge} | {title}", value=entity))
+        is_broadcast = (
+            isinstance(entity, types.Channel)
+            and getattr(
+                entity,
+                "broadcast",
+                False,
+            )
+        )
+
+        badge = (
+            "📢 Channel"
+            if is_broadcast
+            else "👥 Group  "
+        )
+
+        title = (
+            getattr(
+                entity,
+                "title",
+                None,
+            )
+            or dialog.name
+            or str(peer_id)
+        )
+
+        choices.append(
+            questionary.Choice(
+                f"{badge} | {title}",
+                value=entity,
+            )
+        )
 
     if not choices:
-        raise ValueError("No active groups or channels found in your Telegram account.")
+        raise ValueError(
+            "No active groups or channels found "
+            "in your Telegram account."
+        )
 
     selected = await questionary.select(
-        "Select destination group/channel (Use ↑/↓ arrows and press Enter):",
+        "Select destination group/channel "
+        "(Use ↑/↓ arrows and press Enter):",
         choices=choices,
         use_indicator=True,
     ).ask_async()
 
     if selected is None:
         raise KeyboardInterrupt
-    return await _ensure_valid_peer(client, selected)
+
+    return await _ensure_valid_entity(
+        client,
+        selected,
+    )
 
 
-def display_destination(entity: Any) -> str:
-    title = getattr(entity, "title", None)
-    username = getattr(entity, "username", None)
+def display_destination(
+    entity: Any,
+) -> str:
+    """Return a human-readable Telegram destination name."""
+    title = getattr(
+        entity,
+        "title",
+        None,
+    )
+
+    username = getattr(
+        entity,
+        "username",
+        None,
+    )
+
     if title and username:
         return f"{title} (@{username})"
-    return title or (f"@{username}" if username else str(get_peer_id(entity)))
+
+    if title:
+        return title
+
+    if username:
+        return f"@{username}"
+
+    return str(
+        get_peer_id(entity)
+    )
